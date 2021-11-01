@@ -24,7 +24,13 @@ pacman::p_load(
 ```{r}
 
 url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv"
+
+covid <- read.csv(url)
+
+# view(covid)
 ```
+Pulled array is 3342 rows and 660 columns.
+Columns include geolocation information, population, and each date from Jan 22, 2020 (formatted  Xm.d.yy) with an entry of number of deaths reported on a certain date in that county. 
 
 2. There are several columns that we will not need to work with or that should be renamed to improve the clarity of the fields.
 
@@ -46,19 +52,41 @@ Rename:
 Write this to an object called `covid`.
 
 ```{r}
-
+covid <-
+  covid %>%
+  rename("County" = Admin2) %>%
+  select(-UID, -iso2, -iso3, -code3, -Country_Region, -Lat, -Long_, -Combined_Key)
 ```
+Revised data frame has renamed county column and 8 fewer columns; 652 cols w/ same number of rows is expected result.
 
 3. Utilize the `tidycensus` package to read American Community Survey data at the county level for 2019 for the variable `B22007_002`. Call this new object `food_stamps`. It will be helpful downstream to rename the `estimate` and `moe` variables as `food_stamps_estimate` and `food_stamps_moe`. We also will not need the `variable` field.
 
 ```{r}
+census_api_key("ac99ce7b48a240466fc90367e5e9e742e7775de9", install = TRUE)
+# Now key is robust across sessions
 
+food_stamps <-
+get_acs(geography = "county",
+        variable = "B22007_002",
+        year = 2019)
 ```
+```{r}
+food_stamps <-
+  food_stamps %>%
+  rename("food_stamps_estimate" = estimate, "food_stamps_moe" = moe) %>%
+  select(-variable)
+```
+
 
 4. Re-shape the `covid` dataframe from wide to long such that there is a `date` column and a `deaths` column. Write this to a new dataframe called `covid_long`.
 
 ```{r}
-
+covid_long <-
+  pivot_longer(covid,
+               cols = c(starts_with("X")),
+               names_to = "date",
+               values_to = "deaths"
+              )
 ```
 
 5. The `FIPS` value in the `covid_long` dataset and the `GEOID` value in the `food_stamps` dataset represent the same unique ID for each county in the US. Currently, we cannot join the two fields together, though. What is the reason why this is not possible?
@@ -69,14 +97,20 @@ Adjust the `FIPS` field in the `covid_long` dataset with the following code to f
 covid_long <- 
   covid_long %>% 
   mutate(FIPS = str_pad(FIPS, 5, pad = "0"))
-```
 
+glimpse(covid_long)   # view() crashed RStudio. 2 million+ rows may be too big to show full table.
+```
+Joining requires an exact match of fields. Before the adjustment step, FIPS lacks leading zeros for the state portion of the geocode, which will lead to all counties from 9 states failing to match.
+This code is adjusting the content of the FIPS column to add leading 0s to the values to a total width of 5 characters, enabling the required exact match for all locations. 
 
 
 6. Join the `food_stamps` dataframe to the `covid_long` dataframe. Identify the field in each dataframe that will be used as the primary key. Call this new dataframe `covid_joined`. After completing the join, you may notice the `County` and `Province_State` fields in relation to the `NAME` field as a confirmation that you successfully completed your join.
 
 ```{r}
-
+covid_joined <- 
+ left_join(x = covid_long,
+           y = food_stamps,
+           by = c("FIPS" = "GEOID")) 
 ```
 7. Our new data frame will require some light cleaning as well:
 
@@ -89,25 +123,115 @@ covid_long <-
 -   Assign this back to the `covid_joined` object.
 
 ```{r}
+covid_joined <-
+  covid_joined %>%
+    filter(County != "Unassigned") %>% # scrub unassigned counties
+    select(-NAME) %>%   # scrub redundant/concatenated col "NAME" 
+  
+        # eliminate X, swap delimiter, and recode chr as date
+    mutate(date = str_replace(date, "X", "")) %>%   
+    mutate(date = str_replace_all(date, "\\.", "/"))  %>% 
+    mutate(date = as.Date(date, format = "%m/%d/%y")) %>%
+  
+    select(FIPS, County, "State" = Province_State, date, deaths, Population, food_stamps_estimate, food_stamps_moe) # reorder cols
 
+  
 ```
+
 
 8. How have the number of deaths changed over time for Delaware counties? Build a graph to support your answer. Interpret the graph.
 
 ```{r}
-
+covid_joined %>%
+  filter(State == "Delaware", County != "Out of DE") %>%
+  
+  ggplot(aes(x = date, y = deaths, color = County)) +
+  geom_line()+
+  theme_minimal() 
 ```
+Cumulative Covid deaths have risen and plateaued in phases from the start of counting in March 2020 to present. The pattern appears to be consistent across counties in raw numbers, but the comparison will be more conclusive if viewed on a per-capita basis.
+
+```{r}
+covid_joined %>%
+  filter(State == "Delaware", County != "Out of DE") %>%
+  mutate(deaths_per_capita = deaths / Population) %>%
+  
+  ggplot(aes(x = date, y = deaths_per_capita, color = County)) +
+  geom_line()+
+  theme_minimal() + 
+  scale_y_continuous(labels = scales::percent) +    # scales as % 
+  labs(x = "Date",
+       y = "Deaths per Capita",
+       title = "Delaware Cumulative COVID-19 deaths")
+```
+While New Castle County has the highest number of individual deaths, deaths per capita have consistently been higher in Sussex than in New Castle & Kent counties. The per capita death rate in Kent started out comparable to New Castle County, but has increased to parallel the rate in Sussex Co.
+
+The first rise corresponds to initial recognized spread in March-April 2020, leveling off after the initial restriction period through summer 2020. The death rate began to rise sharply again in fall 2020 through the winter, leveling off again with wide vaccine deployment in spring 2021. The sharp rise in Jul-Aug 2021 is a data correction from review of records (per Del. Dept. Health & Human Services); most of these corrections are small but a large correction was released on 30 July 2021, giving the appearance of a sharp instantaneous rise. Since mid-August 2021, the death rate has been increasing again, more sharply in Sussex and Kent counties than in New Castle Co.
+
 
 9. Consider counties in Delaware, Maryland, Pennsylvania, New York, and New Jersey.
 
 What is the per capita death rate for each county? Which county has the highest per capita death rate?
 
 ```{r}
+mid_atl_states <- c("Delaware", "Maryland", "New Jersey", "New York", "Pennsylvania")
 
+covid_mid_atlantic <- 
+  covid_joined %>%  # Save mutated data set
+    filter(State == mid_atl_states) %>%         # filter state
+    filter(!str_detect(County, "Out of")) %>%   # filter out of state "county"
+    mutate(deaths_per_capita = deaths / Population,
+           food_st_per_cap = food_stamps_estimate / Population) 
+
+covid_mid_atlantic %>%
+  group_by(County, State) %>%
+  summarise(max(deaths_per_capita)) %>%
+   
+  arrange(desc(`max(deaths_per_capita)`)) %>%   
+                #Use `` to enclose field name containing parentheses
+  ungroup()
 ```
+The tibble shows the death rate per capita ranked from highest to lowest. Bronx, NY has had the highest rate per capita. 
+
+It is somewhat surprising to me  that 4 rural counties in central PA are among the top 10 highest death rates. All 6 other members of the top 10 are part of the metropolitan region around New York City, which took an early and very hard hit in terms of death toll. Rural PA has a much lower population density, so the rate per capita reflects many fewer individual deaths but the same relative impact of community loss.
+
 
 10. Create a graph that demonstrates the relationship between food stamps per capita and deaths per capita for Delaware, Maryland, Pennsylvania, New York, and New Jersey. Interpret the graph.
 
 ```{r}
+# state level... is this what's meant??
+covid_mid_atlantic %>%
+  group_by(County) %>%
+  filter(deaths == max(deaths)) %>%
+  ungroup() %>%
+  group_by(State) %>%
+  summarise(death_st = sum(deaths), Population_st = sum(Population), food_stamps_st = sum(food_stamps_estimate)) %>%
+  mutate(death_st_per_cap = death_st / Population_st,
+         food_stamps_st_per_cap = food_stamps_st / Population_st) %>%
+  ungroup()
 
 ```
+So... I don't think that's the intended data to plot. Redo retaining county-level granularity.
+
+```{r}
+# county level calculation... and plot by state
+covid_mid_atlantic %>%
+  group_by(County, State, food_st_per_cap) %>%
+  summarise(death_per_cap = max(deaths_per_capita)) %>%
+  arrange(desc(death_per_cap)) %>%   
+  ungroup() %>%
+
+  ggplot(aes(x = food_st_per_cap, y = death_per_cap, color = State)) +
+  geom_point() + 
+  facet_wrap("State", 2, 3) +     # separate states into panes
+  theme_minimal() + 
+  scale_x_continuous(labels = scales::percent) +    # scales as % 
+  scale_y_continuous(labels = scales::percent) +    # scales as % 
+  labs(x = "Food Stamp Utilization per Capita",
+       y = "Deaths per Capita",
+       title = "Rates of Food Stamps vs Cumulative COVID-19 deaths") 
+
+```
+There seems to be a positive correlation between food stamp utilization and Covid deaths per capita. The exact distribution shape varies by state, but generally it is unlikely for counties with a high rate of food stamp utilization to have a low rate of death from Covid. Similarly, very few counties with a high death rate have low food stamp enrollment rates. 
+
+Because food stamp enrollment is a common proxy measure for poverty, this indicates a correlation that may be relevant to public health efforts to control the virus. Examination of further correlating variables, such as employment statistics or the availability of financial/housing assistance, may reveal potential interventions that can help limit the impact of Covid on communities.
